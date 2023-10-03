@@ -12,6 +12,8 @@ use PhpRbacBundle\Entity\PermissionInterface;
 use PhpRbacBundle\Core\Manager\NodeManagerInterface;
 use PhpRbacBundle\Exception\RbacPermissionNotFoundException;
 use Doctrine\Bundle\DoctrineBundle\Repository\ServiceEntityRepository;
+use Symfony\Component\Security\Core\User\UserInterface;
+use Symfony\Bridge\Doctrine\Types\UlidType;
 
 /**
  * @method Permission|null find($id, $lockMode = null, $lockVersion = null)
@@ -40,7 +42,7 @@ class PermissionRepository extends ServiceEntityRepository implements NestedSetI
 
     public function initTable()
     {
-        $sql = "SET FOREIGN_KEY_CHECKS = 0; TRUNCATE role_permission; TRUNCATE {$this->tableName}; SET FOREIGN_KEY_CHECKS = 1";
+        $sql = "SET FOREIGN_KEY_CHECKS = 0; TRUNCATE rbac_role_rbac_permission; TRUNCATE {$this->tableName}; SET FOREIGN_KEY_CHECKS = 1";
         $this->getEntityManager()
             ->getConnection()
             ->executeQuery($sql);
@@ -118,7 +120,7 @@ class PermissionRepository extends ServiceEntityRepository implements NestedSetI
                         {$this->tableName} AS parent
                     WHERE
                         node.tree_left BETWEEN parent.tree_left AND parent.tree_right
-                        AND (node.id = :nodeI)
+                        AND (node.id = :nodeId)
                     GROUP BY
                         node.id
                     ORDER BY
@@ -151,8 +153,33 @@ class PermissionRepository extends ServiceEntityRepository implements NestedSetI
         return $result;
     }
 
-    public function hasPermission(int $permissionId, mixed $userId): bool
+    public function hasPermission(int $permissionId, $user): bool
     {
+        $userRoleTable = '';
+        $userRoles = $user->getRbacRoles();
+        $userIdName = null;
+        if (!empty($userRoles)) {
+            $userRoleTable = $this->getEntityManager()
+                ->getClassMetadata(get_class($user))
+                ->getAssociationMapping('rbacRoles')["joinTable"]["name"];
+
+            foreach ($this->getEntityManager()
+                         ->getClassMetadata(get_class($user))
+                         ->getAssociationMapping('rbacRoles')["joinTable"] ["joinColumns"] as $joinColum){
+                if($joinColum["name"] !=='role_id'){
+                    $userIdName=   $joinColum["name"];
+                    continue;
+                }
+
+            }
+
+        } else {
+            return false;
+        }
+        if (empty($userRoleTable)||empty($userIdName)) {
+            return false;
+        }
+
         $pdo = $this->getEntityManager()
             ->getConnection();
 
@@ -160,9 +187,9 @@ class PermissionRepository extends ServiceEntityRepository implements NestedSetI
             SELECT
                 COUNT(*) AS result
             FROM
-                user_role
+                {$userRoleTable}
             INNER JOIN
-                {$this->roleTableName} AS TRdirect ON TRdirect.ID=user_role.role_id
+                {$this->roleTableName} AS TRdirect ON TRdirect.ID={$userRoleTable}.role_id
             INNER JOIN
                 {$this->roleTableName} AS TR ON TR.tree_left BETWEEN TRdirect.tree_left AND TRdirect.tree_right
             INNER JOIN
@@ -170,14 +197,14 @@ class PermissionRepository extends ServiceEntityRepository implements NestedSetI
                     INNER JOIN
                     {$this->tableName} AS TP ON TPdirect.tree_left BETWEEN TP.tree_left AND TP.tree_right
                     INNER JOIN
-                        role_permission AS TRel ON TP.ID=TRel.permission_id
+                        rbac_role_rbac_permission AS TRel ON TP.ID=TRel.permission_id
                 ) ON TR.ID = TRel.role_id
             WHERE
-                user_role.user_id = :userId
+                {$userRoleTable}.{$userIdName} = :userId
                 AND TPdirect.id = :permissionId
         ";
         $query = $pdo->prepare($sql);
-        $query->bindValue(":userId", $userId);
+        $query->bindValue(":userId", $user->getId(), UlidType::NAME);
         $query->bindValue(":permissionId", $permissionId);
         $stmt = $query->executeQuery();
 

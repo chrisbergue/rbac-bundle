@@ -2,6 +2,7 @@
 
 namespace PhpRbacBundle\Repository;
 
+use Doctrine\Common\Collections\ArrayCollection;
 use Doctrine\ORM\ORMException;
 use PhpRbacBundle\Entity\Role;
 use PhpRbacBundle\Entity\RoleInterface;
@@ -12,6 +13,8 @@ use PhpRbacBundle\Entity\PermissionInterface;
 use PhpRbacBundle\Core\Manager\NodeManagerInterface;
 use PhpRbacBundle\Exception\RbacRoleNotFoundException;
 use Doctrine\Bundle\DoctrineBundle\Repository\ServiceEntityRepository;
+use Symfony\Bridge\Doctrine\Types\UlidType;
+use Symfony\Component\Security\Core\User\UserInterface;
 
 /**
  * @method Role|null find($id, $lockMode = null, $lockVersion = null)
@@ -39,13 +42,13 @@ class RoleRepository extends ServiceEntityRepository implements NestedSetInterfa
 
     public function initTable()
     {
-        $sql = "SET FOREIGN_KEY_CHECKS = 0; TRUNCATE user_role; TRUNCATE role_permission; TRUNCATE {$this->tableName};SET FOREIGN_KEY_CHECKS = 1;";
+        $sql = "SET FOREIGN_KEY_CHECKS = 0; TRUNCATE user_role; TRUNCATE rbac_role_rbac_permission; TRUNCATE {$this->tableName};SET FOREIGN_KEY_CHECKS = 1;";
         $this->getEntityManager()
             ->getConnection()
             ->executeQuery($sql);
 
         $sql = "INSERT INTO {$this->tableName} (id, code, description, tree_left, tree_right) VALUES (1, 'root', 'root', 0, 1);";
-        $sql .= "INSERT INTO role_permission (role_id, permission_id) VALUES (1, 1)";
+        $sql .= "INSERT INTO rbac_role_rbac_permission (role_id, permission_id) VALUES (1, 1)";
         $this->getEntityManager()
             ->getConnection()
             ->executeQuery($sql);
@@ -99,7 +102,7 @@ class RoleRepository extends ServiceEntityRepository implements NestedSetInterfa
     {
         $sql = "
             SELECT
-                node.*,
+                node.id,
                 (COUNT(parent.id)-1 - (sub_tree.innerDepth )) AS depth
             FROM
                 {$this->tableName} as node,
@@ -107,18 +110,18 @@ class RoleRepository extends ServiceEntityRepository implements NestedSetInterfa
                 {$this->tableName} as sub_parent,
                 (
                     SELECT
-                        node.id,
+                        role.id,
                         (COUNT(parent.id) - 1) AS innerDepth
                     FROM
-                        {$this->tableName} AS node,
+                        {$this->tableName} AS role,
                         {$this->tableName} AS parent
                     WHERE
-                        node.tree_left BETWEEN parent.tree_left AND parent.tree_right
-                        AND (node.id = :nodeI)
+                        role.tree_left BETWEEN parent.tree_left AND parent.tree_right
+                        AND (role.id = :nodeId)
                     GROUP BY
-                        node.id
+                        role.id
                     ORDER BY
-                        node.tree_left
+                        role.tree_left
                 ) AS sub_tree
             WHERE
                 node.tree_left BETWEEN parent.tree_left AND parent.tree_right
@@ -129,11 +132,11 @@ class RoleRepository extends ServiceEntityRepository implements NestedSetInterfa
             HAVING
                 depth = 1
             ORDER BY
-                node.tree_left
+                node.tree_left;
         ";
 
         $rsm = new ResultSetMapping();
-        $rsm->addEntityResult($this->getClassName(), 'node');
+//        $rsm->addEntityResult($this->getClassName(), 'node');
         $query = $this->getEntityManager()
             ->createNativeQuery($sql, $rsm);
         $query->setParameter(':nodeId', $nodeId);
@@ -149,7 +152,7 @@ class RoleRepository extends ServiceEntityRepository implements NestedSetInterfa
 
     public function deletePermissions(Role $role): Role
     {
-        $role->setPermissions(null);
+        $role->setPermissions(new ArrayCollection());
         $this->add($role, true);
 
         return $role;
@@ -163,9 +166,9 @@ class RoleRepository extends ServiceEntityRepository implements NestedSetInterfa
         $sql = "
             SELECT
                 COUNT(*) AS result
-                FROM role_permission
-                INNER JOIN {$this->permissionTableName} AS permission ON permission.id = role_permission.permission_id
-                INNER JOIN {$this->tableName} AS role ON role.id = role_permission.role_id
+                FROM rbac_role_rbac_permission
+                INNER JOIN {$this->permissionTableName} AS permission ON permission.id = rbac_role_rbac_permission.permission_id
+                INNER JOIN {$this->tableName} AS role ON role.id = rbac_role_rbac_permission.role_id
             WHERE
                 role.tree_left BETWEEN
                     (SELECT tree_left FROM {$this->tableName} WHERE ID = :roleId)
@@ -197,8 +200,31 @@ class RoleRepository extends ServiceEntityRepository implements NestedSetInterfa
         return $row['result'] >= 1;
     }
 
-    public function hasRole(int $roleId, mixed $userId): bool
+    public function hasRole(int $roleId, $user): bool
     {
+        $userRoleTable = '';
+        $userRoles = $user->getRbacRoles();
+        $userIdName = null;
+        if (!empty($userRoles)) {
+            $userRoleTable = $this->getEntityManager()
+                ->getClassMetadata(get_class($user))
+                ->getAssociationMapping('rbacRoles')["joinTable"]["name"];
+            foreach ($this->getEntityManager()
+                         ->getClassMetadata(get_class($user))
+                         ->getAssociationMapping('rbacRoles')["joinTable"] ["joinColumns"] as $joinColum) {
+                if ($joinColum["name"] !== 'role_id') {
+                    $userIdName = $joinColum["name"];
+                    continue;
+                }
+
+            }
+        } else {
+            return false;
+        }
+        if (empty($userRoleTable) || empty($userIdName)) {
+            return false;
+        }
+
         $pdo = $this->getEntityManager()
             ->getConnection();
 
@@ -206,17 +232,17 @@ class RoleRepository extends ServiceEntityRepository implements NestedSetInterfa
             SELECT
                 COUNT(*) as result
             FROM
-                user_role
+                {$userRoleTable}
             INNER JOIN
-                {$this->tableName} AS TRdirect ON (TRdirect.id=user_role.role_id)
+                {$this->tableName} AS TRdirect ON (TRdirect.id= {$userRoleTable}.role_id)
             INNER JOIN
                 {$this->tableName} AS TR ON (TR.tree_left BETWEEN TRdirect.tree_left AND TRdirect.tree_right)
             WHERE
-                user_role.user_id = :userId AND TR.ID = :roleId
+                 {$userRoleTable}.{$userIdName} = :userId AND TR.ID = :roleId
         ";
         $query = $pdo->prepare($sql);
         $query->bindValue(":roleId", $roleId);
-        $query->bindValue(":userId", $userId);
+        $query->bindValue(":userId", $userId, UlidType::NAME);
         $stmt = $query->executeQuery();
         if ($stmt->rowCount() == 0) {
             return false;
